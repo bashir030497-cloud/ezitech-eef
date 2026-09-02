@@ -1,0 +1,4 @@
+base_image: "node:20-slim"
+run_command: "sh -c 'npm install && npm start'"
+health_endpoint: "http://localhost:3000/health"
+auth_endpoint: "http://localhost:3000/api/auth/login"
