@@ -18,5 +18,7 @@ class LeaderboardEntry(Base):
     build_time_seconds = Column(Float)
     architecture_score = Column(Float)
     api_quality_score = Column(Float)
+    documentation_score = Column(Float)
+    performance_score = Column(Float)
 
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

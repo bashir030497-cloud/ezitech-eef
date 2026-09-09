@@ -2,3 +2,5 @@ base_image: "php:8.2-cli"
 run_command: "sh -c 'composer install && php artisan serve --host=0.0.0.0 --port=8000'"
 health_endpoint: "http://localhost:8000/api/health"
 auth_endpoint: "http://localhost:8000/api/login"
+build_timeout_seconds: 600
+boot_wait_seconds: 5

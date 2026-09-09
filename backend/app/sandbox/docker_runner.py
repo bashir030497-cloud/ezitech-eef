@@ -5,13 +5,15 @@ from app.core.config import settings
 from app.core.logger import get_logger
 from app.models.submission import Submission, SubmissionStatus
 from app.sandbox.repo_handler import clone_repo, cleanup_repo
-from app.sandbox.language_configs.config_loader import get_language_config
+from app.sandbox.language_configs.config_loader import get_language_config, detect_custom_dockerfile
 from app.validation.structure_check import check_structure
 from app.validation.api_check import check_api
 from app.validation.db_check import check_database
 from app.validation.auth_check import check_auth
 from app.validation.security_check import check_security
 from app.testing.api_test_runner import run_api_tests
+from app.testing.db_test_runner import run_db_tests
+from app.testing.perf_check import run_perf_check
 from app.ai_engine.scorer import calculate_scores
 from app.ai_engine.feedback_generator import generate_feedback
 from app.ai_engine.plagiarism_check import check_plagiarism
@@ -19,6 +21,7 @@ from app.reports.report_builder import build_report
 from app.models.evaluation import Evaluation
 from app.models.score import Score
 from app.models.leaderboard import LeaderboardEntry
+from app.models.test_result import TestResult
 
 logger = get_logger("docker_runner")
 client = docker.from_env()
@@ -28,44 +31,80 @@ def run_sandbox_pipeline(submission_id, db: Session):
     submission = db.query(Submission).filter(Submission.id == submission_id).first()
     local_path = None
     container = None
+    build_start_time = None
+    build_time_seconds = None
 
     try:
-        # 1. Clone
         submission.status = SubmissionStatus.CLONING
         db.commit()
         local_path = clone_repo(submission.source_url, str(submission.id))
 
-        # 2. Build + Run
         submission.status = SubmissionStatus.BUILDING
         db.commit()
         config = get_language_config(submission.language_stack)
 
-        container = client.containers.run(
-            image=config["base_image"],
-            command=config["run_command"],
-            volumes={local_path: {"bind": "/app", "mode": "rw"}},
-            working_dir="/app",
-            detach=True,
-            mem_limit="512m",
-            network_mode="bridge",
-        )
+        custom_dockerfile = detect_custom_dockerfile(local_path)
+        build_start_time = time.time()
+
+        if custom_dockerfile:
+            logger.info(f"Custom Dockerfile detected for {submission.id}, building from it")
+            image, _ = client.images.build(path=local_path, rm=True, forcerm=True)
+            container = client.containers.run(
+                image=image.id,
+                detach=True,
+                mem_limit="1g",
+                network_mode="bridge",
+                ports={"8000/tcp": None},
+            )
+        else:
+            container = client.containers.run(
+                image=config["base_image"],
+                command=config["run_command"],
+                volumes={local_path: {"bind": "/app", "mode": "rw"}},
+                working_dir="/app",
+                detach=True,
+                mem_limit="1g",
+                network_mode="bridge",
+            )
+
         submission.status = SubmissionStatus.RUNNING
         db.commit()
-        time.sleep(5)  # give app time to boot
+        time.sleep(config.get("boot_wait_seconds", 5))
+        build_time_seconds = round(time.time() - build_start_time, 2)
 
-        # 3. Validation
         structure_result = check_structure(local_path)
         api_result = check_api(config.get("health_endpoint"))
         db_result = check_database(local_path)
         auth_result = check_auth(config.get("auth_endpoint"))
         security_result = check_security(local_path)
 
-        # 4. Testing
         submission.status = SubmissionStatus.TESTING
         db.commit()
-        test_results = run_api_tests(local_path, config)
+        api_test_results = run_api_tests(local_path, config)
+        db_test_result = run_db_tests(local_path)
+        perf_result = run_perf_check(config.get("health_endpoint"))
 
-        # 5. AI Scoring + Feedback + Plagiarism
+        all_test_results = list(api_test_results)
+        all_test_results.append({
+            "test_name": "db_migration_check",
+            "passed": db_test_result["passed"],
+            "details": db_test_result["details"],
+        })
+        all_test_results.append({
+            "test_name": "performance_check",
+            "passed": perf_result["passed"],
+            "details": f"{perf_result.get('response_time_ms')} ms",
+        })
+
+        for t in all_test_results:
+            db.add(TestResult(
+                submission_id=submission.id,
+                test_type="api" if "health" in t["test_name"] else t["test_name"].split("_")[0],
+                test_name=t["test_name"],
+                passed=t["passed"],
+                details=str(t.get("details", "")),
+            ))
+
         submission.status = SubmissionStatus.EVALUATING
         db.commit()
 
@@ -76,11 +115,12 @@ def run_sandbox_pipeline(submission_id, db: Session):
             "auth": auth_result,
             "security": security_result,
         }
-        scores = calculate_scores(validation_data, test_results)
-        feedback = generate_feedback(validation_data, test_results, scores)
+        scores = calculate_scores(validation_data, all_test_results)
+        feedback = generate_feedback(validation_data, all_test_results, scores)
         plagiarism = check_plagiarism(local_path, db)
 
-        # 6. Save results
+        documentation_score = 100.0 if structure_result.get("has_readme") else 0.0
+
         score_row = Score(submission_id=submission.id, **scores)
         db.add(score_row)
 
@@ -99,13 +139,15 @@ def run_sandbox_pipeline(submission_id, db: Session):
             overall_score=scores["overall_score"],
             architecture_score=scores["architecture_score"],
             api_quality_score=scores["api_quality_score"],
+            build_time_seconds=build_time_seconds,
+            documentation_score=documentation_score,
+            performance_score=100.0 if perf_result["passed"] else 0.0,
         )
         db.add(leaderboard_row)
 
         submission.status = SubmissionStatus.COMPLETED
         db.commit()
 
-        # 7. Report
         build_report(submission, score_row, eval_row)
 
     except Exception as e:

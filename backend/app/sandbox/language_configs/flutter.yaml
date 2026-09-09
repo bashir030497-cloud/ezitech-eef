@@ -2,3 +2,5 @@ base_image: "ghcr.io/cirruslabs/flutter:stable"
 run_command: "sh -c 'flutter pub get && flutter build web'"
 health_endpoint: ""
 auth_endpoint: ""
+build_timeout_seconds: 900
+boot_wait_seconds: 5

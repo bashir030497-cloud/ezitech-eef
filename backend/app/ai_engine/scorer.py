@@ -2,12 +2,19 @@ def calculate_scores(validation_data: dict, test_results: list) -> dict:
     def to_score(passed: bool, weight: float = 100.0) -> float:
         return weight if passed else 0.0
 
+    def pct_passed(results: list) -> float:
+        if not results:
+            return 0.0
+        passed = sum(1 for r in results if r.get("passed"))
+        return round((passed / len(results)) * 100, 2)
+
     feature_completion = to_score(validation_data["structure"]["passed"])
     code_quality = to_score(validation_data["security"]["passed"])
     architecture = to_score(validation_data["structure"]["passed"] and validation_data["db"]["passed"])
     security = to_score(validation_data["security"]["passed"])
     api_quality = to_score(validation_data["api"]["passed"])
-    deployment_readiness = to_score(all(t["passed"] for t in test_results) if test_results else False)
+    deployment_readiness = pct_passed(test_results)
+
     engineering_maturity = round(
         (feature_completion + code_quality + architecture + security + api_quality + deployment_readiness) / 6, 2
     )
