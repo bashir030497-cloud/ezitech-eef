@@ -19,21 +19,28 @@ Scores: {json.dumps(scores)}
 
     try:
         response = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.openai.com/v1/chat/completions",
             headers={
-                "x-api-key": settings.LLM_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "Authorization": f"Bearer {settings.LLM_API_KEY}",
+                "Content-Type": "application/json",
             },
             json={
                 "model": settings.LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You return only valid JSON, no markdown, no explanation."},
+                    {"role": "user", "content": prompt},
+                ],
                 "max_tokens": 1000,
-                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
             },
             timeout=30,
         )
         data = response.json()
-        text = data["content"][0]["text"]
+
+        if "error" in data:
+            raise RuntimeError(data["error"].get("message", "Unknown OpenAI error"))
+
+        text = data["choices"][0]["message"]["content"]
         clean = text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean)
 
