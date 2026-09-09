@@ -4,8 +4,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.models.submission import Submission, SubmissionStatus
-from app.sandbox.repo_handler import clone_repo, cleanup_repo
-from app.sandbox.language_configs.config_loader import get_language_config, detect_custom_dockerfile
+from app.sandbox.repo_handler import get_project_source, cleanup_repo
+from app.sandbox.language_configs.config_loader import (
+    get_language_config, detect_custom_dockerfile, detect_custom_compose,
+)
+from app.sandbox.compose_runner import compose_up, compose_down, compose_service_port
 from app.validation.structure_check import check_structure
 from app.validation.api_check import check_api
 from app.validation.db_check import check_database
@@ -31,22 +34,42 @@ def run_sandbox_pipeline(submission_id, db: Session):
     submission = db.query(Submission).filter(Submission.id == submission_id).first()
     local_path = None
     container = None
+    is_compose_run = False
+    compose_project_name = f"eef-{str(submission.id)[:8]}"
     build_start_time = None
     build_time_seconds = None
+    health_endpoint = None
+    auth_endpoint = None
 
     try:
         submission.status = SubmissionStatus.CLONING
         db.commit()
-        local_path = clone_repo(submission.source_url, str(submission.id))
+        local_path = get_project_source(submission, str(submission.id))
 
         submission.status = SubmissionStatus.BUILDING
         db.commit()
         config = get_language_config(submission.language_stack)
+        health_endpoint = config.get("health_endpoint")
+        auth_endpoint = config.get("auth_endpoint")
 
+        custom_compose = detect_custom_compose(local_path)
         custom_dockerfile = detect_custom_dockerfile(local_path)
         build_start_time = time.time()
 
-        if custom_dockerfile:
+        if custom_compose:
+            logger.info(f"Custom docker-compose stack detected for {submission.id}")
+            is_compose_run = True
+            compose_up(local_path, compose_project_name, timeout=600)
+            mapped_port = None
+            for service_guess in ("app", "backend", "api", "web"):
+                mapped_port = compose_service_port(local_path, compose_project_name, service_guess, 8000)
+                if mapped_port:
+                    break
+            if mapped_port:
+                health_endpoint = f"http://localhost:{mapped_port}/health"
+                auth_endpoint = f"http://localhost:{mapped_port}/auth/login"
+
+        elif custom_dockerfile:
             logger.info(f"Custom Dockerfile detected for {submission.id}, building from it")
             image, _ = client.images.build(path=local_path, rm=True, forcerm=True)
             container = client.containers.run(
@@ -69,20 +92,20 @@ def run_sandbox_pipeline(submission_id, db: Session):
 
         submission.status = SubmissionStatus.RUNNING
         db.commit()
-        time.sleep(config.get("boot_wait_seconds", 5))
+        time.sleep(config.get("boot_wait_seconds", 5) if not is_compose_run else 15)
         build_time_seconds = round(time.time() - build_start_time, 2)
 
         structure_result = check_structure(local_path)
-        api_result = check_api(config.get("health_endpoint"))
+        api_result = check_api(health_endpoint)
         db_result = check_database(local_path)
-        auth_result = check_auth(config.get("auth_endpoint"))
+        auth_result = check_auth(auth_endpoint)
         security_result = check_security(local_path)
 
         submission.status = SubmissionStatus.TESTING
         db.commit()
-        api_test_results = run_api_tests(local_path, config)
+        api_test_results = run_api_tests(local_path, {"health_endpoint": health_endpoint})
         db_test_result = run_db_tests(local_path)
-        perf_result = run_perf_check(config.get("health_endpoint"))
+        perf_result = run_perf_check(health_endpoint)
 
         all_test_results = list(api_test_results)
         all_test_results.append({
@@ -162,5 +185,7 @@ def run_sandbox_pipeline(submission_id, db: Session):
                 container.remove()
             except Exception:
                 pass
+        if is_compose_run and local_path:
+            compose_down(local_path, compose_project_name)
         if local_path:
             cleanup_repo(local_path)

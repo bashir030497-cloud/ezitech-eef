@@ -17,3 +17,11 @@ def detect_custom_dockerfile(local_path: str):
     if os.path.exists(dockerfile_path):
         return dockerfile_path
     return None
+
+
+def detect_custom_compose(local_path: str):
+    for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
+        path = os.path.join(local_path, name)
+        if os.path.exists(path):
+            return path
+    return None
